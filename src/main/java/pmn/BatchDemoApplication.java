@@ -1,21 +1,38 @@
 package pmn;
 
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 import javax.sql.DataSource;
 
+import org.quartz.JobBuilder;
+import org.quartz.JobDetail;
+import org.quartz.JobExecutionContext;
+import org.quartz.JobExecutionException;
+import org.quartz.SimpleScheduleBuilder;
+import org.quartz.Trigger;
+import org.quartz.TriggerBuilder;
 import org.springframework.batch.core.Job;
+import org.springframework.batch.core.JobParameters;
+import org.springframework.batch.core.JobParametersBuilder;
+import org.springframework.batch.core.JobParametersInvalidException;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.StepContribution;
 import org.springframework.batch.core.StepExecutionListener;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
 import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
+import org.springframework.batch.core.explore.JobExplorer;
 import org.springframework.batch.core.job.builder.FlowBuilder;
 import org.springframework.batch.core.job.flow.Flow;
 import org.springframework.batch.core.job.flow.JobExecutionDecider;
 import org.springframework.batch.core.job.flow.support.SimpleFlow;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.repository.JobExecutionAlreadyRunningException;
+import org.springframework.batch.core.repository.JobInstanceAlreadyCompleteException;
+import org.springframework.batch.core.repository.JobRestartException;
 import org.springframework.batch.core.scope.context.ChunkContext;
 import org.springframework.batch.core.step.tasklet.Tasklet;
 import org.springframework.batch.item.ItemProcessor;
@@ -44,12 +61,17 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.quartz.QuartzJobBean;
 
 
 
 @SpringBootApplication
 @EnableBatchProcessing
-public class BatchDemoApplication {
+@EnableScheduling
+public class BatchDemoApplication extends QuartzJobBean{
 	
 	public static String[] tokens = new String[] {"order_id", "first_name", "last_name", "email", "cost", "item_id", "item_name", "ship_date"};
 
@@ -79,10 +101,194 @@ public class BatchDemoApplication {
 	@Autowired
 	public StepBuilderFactory stepBuilderFactory;
 	
+	@Autowired
+	public JobLauncher jobLauncher;
+	
+	@Autowired
+	public JobExplorer jobExplorer;
 	
 	
+	/* Scheduling with Quartz */
 	
-	/* CHUNK TWELVE : MULTI PROCESOR BIS TO VALIDATE BEAN */
+	@Bean
+	public Trigger trigger() {
+		SimpleScheduleBuilder scheduleBuilder = SimpleScheduleBuilder
+				.simpleSchedule()
+				.withIntervalInSeconds(30)
+				.repeatForever();
+		
+		return TriggerBuilder.newTrigger()
+				.forJob(jobDetail())
+				.withSchedule(scheduleBuilder)
+				.build();
+	}
+	
+	@Bean
+	public JobDetail jobDetail() {
+		return JobBuilder.newJob(BatchDemoApplication.class)
+				.storeDurably()
+				.build();
+	}
+	
+	@Override
+	protected void executeInternal(JobExecutionContext context) throws JobExecutionException {
+
+		JobParameters parameters = new JobParametersBuilder(jobExplorer)
+				.getNextJobParameters(jobQuartz())
+				.toJobParameters();
+		
+		try {
+			
+			this.jobLauncher.run(jobQuartz(), parameters);
+			
+		} catch (JobExecutionAlreadyRunningException | JobRestartException | JobInstanceAlreadyCompleteException
+				| JobParametersInvalidException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}		
+	}
+	
+	@Bean
+	public Step stepQuartz() {
+		return this.stepBuilderFactory.get("stepQuartz").tasklet(new Tasklet() {
+			
+			@Override
+			public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+				System.out.println("The run time is: " + LocalDateTime.now());
+				return RepeatStatus.FINISHED;
+			}
+		}).build();
+
+	}
+
+	@Bean
+	public Job jobQuartz() {
+		return this.jobBuilderFactory.get("jobQuartz").incrementer(new RunIdIncrementer()).start(stepQuartz()).build();
+	}
+	
+	/* Scheduling with Spring */
+	
+	/*
+	
+	@Scheduled(cron = "0/30 * * * * *")
+	public void runJob() throws JobExecutionAlreadyRunningException, JobRestartException, JobInstanceAlreadyCompleteException, JobParametersInvalidException, Exception {
+		JobParametersBuilder paramBuilder = new JobParametersBuilder();
+		paramBuilder.addDate("runTime", new Date());
+		this.jobLauncher.run(jobScheduling(), paramBuilder.toJobParameters());
+	}
+
+	@Bean
+	public Step stepScheduling() throws Exception {
+		return this.stepBuilderFactory.get("stepScheduling").tasklet(new Tasklet() {
+			
+			@Override
+			public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+				System.out.println("The run time is: " + LocalDateTime.now());
+				return RepeatStatus.FINISHED;
+			}
+		}).build();
+
+	}
+
+	@Bean
+	public Job jobScheduling() throws Exception {
+		return this.jobBuilderFactory.get("jobScheduling").start(stepScheduling()).build();
+	}
+	*/
+	
+	
+/* CHUNK FOURTEEN : MULTI PROCESOR  +  RETRY LOGIC + MULTI THREAD JOB */
+	
+	@Bean
+	public ItemReader<Order> itemReaderMultiThread() throws Exception {
+		
+		return new JdbcPagingItemReaderBuilder<Order>()
+				.dataSource(this.datasource)
+				.name("jdbcCursorItemReader")
+				.queryProvider(queryProvider())
+				.rowMapper(new OrderRowMapper())
+				.pageSize(10)
+				.saveState(false)
+				.build();
+		}
+	
+	@Bean
+	public TaskExecutor taskExecutor() {
+		ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+		executor.setCorePoolSize(2);
+		executor.setMaxPoolSize(10);
+		return executor;
+	}
+	
+	
+	@Bean
+	public ItemWriter<TrackedOrder> itemWriterMultiProcessorMultiThread() {
+		return new JdbcBatchItemWriterBuilder<TrackedOrder>()
+				.dataSource(datasource)
+				.sql(INSERT_ORDER_SQL_BIS)
+				.beanMapped()
+				.build();
+	}
+	
+	@Bean
+	public Step chunkMultiProcessorvMultiThreadStep() throws Exception {
+		return this.stepBuilderFactory.get("chunkMultiProcessorvMultiThreadStep")
+				.<Order,TrackedOrder>chunk(10)
+				.reader(itemReaderMultiThread())
+				.processor(compositeItemProcessorRetry())
+				.faultTolerant()
+				.retry(OrderProcessingException.class)
+				.retryLimit(3)
+				.listener(new CustomRetryListener())
+				.writer(itemWriterMultiProcessorMultiThread())
+				.taskExecutor(taskExecutor())
+				.build();	
+	}
+	
+	@Bean 
+	public Job jobMultiProcessorMultiThread() throws Exception {
+		return this.jobBuilderFactory.get("jobMultiProcessorMultiThread").start(chunkMultiProcessorvMultiThreadStep()).build();
+	}
+	
+	
+	/* CHUNK THIRTEEN : MULTI PROCESOR BIS +  RETRY LOGIC */
+	
+	@Bean
+	public ItemProcessor<Order, TrackedOrder> compositeItemProcessorRetry() {
+		return new CompositeItemProcessorBuilder<Order,TrackedOrder>()
+				.delegates(orderValidatingItemProcessor(), trackedOrderItemProcessor(),freeShippingItemProcessor())
+				.build();
+	}
+	
+	@Bean
+	public ItemWriter<TrackedOrder> itemWriterMultiProcessorRetry() {
+		return new JsonFileItemWriterBuilder<TrackedOrder>()
+				.jsonObjectMarshaller(new JacksonJsonObjectMarshaller<TrackedOrder>())
+				.resource( new FileSystemResource("/Users/sarahrouini/sst/batch-demo/src/main/resources/data/shipped_orders_output.json"))
+				.name("jsonItemWriter")
+				.build();
+	}
+	
+	@Bean
+	public Step chunkMultiProcessorvRetryStep() throws Exception {
+		return this.stepBuilderFactory.get("chunkMultiProcessorvRetryStep")
+				.<Order,TrackedOrder>chunk(10)
+				.reader(orderItemReaderPagingJDBC())
+				.processor(compositeItemProcessorRetry())
+				.faultTolerant()
+				.retry(OrderProcessingException.class)
+				.retryLimit(3)
+				.listener(new CustomRetryListener())
+				.writer(itemWriterMultiProcessorRetry())
+				.build();	
+	}
+	
+	@Bean 
+	public Job jobMultiProcessorRetry() throws Exception {
+		return this.jobBuilderFactory.get("jobMultiProcessorRetry").start(chunkMultiProcessorvRetryStep()).build();
+	}
+	
+	/* CHUNK TWELVE : MULTI PROCESOR BIS +  SKIP LOGIC */
 	@Bean
 	public ItemProcessor<TrackedOrder, TrackedOrder> freeShippingItemProcessor() {
 		return new FreeShippingItemProcessor();
@@ -731,5 +937,7 @@ public class BatchDemoApplication {
 	public static void main(String[] args) {
 		SpringApplication.run(BatchDemoApplication.class, args);
 	}
+
+	
 
 }
